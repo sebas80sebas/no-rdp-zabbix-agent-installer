@@ -156,6 +156,242 @@ Add this line at the beginning of the script if you want to verify connectivity 
 **Auditable** - All actions logged in Azure Activity Log  
 **Secure** - Leverages Azure RBAC for access control
 
+## Deployment Without Internet Connectivity
+
+If your Windows VMs don't have internet access, you can host the Zabbix Agent installer in Azure Storage and use Run Command to download it directly from there.
+
+### Prerequisites for Offline Installation
+- Azure Storage Account in the same region as your VMs
+- Zabbix Agent MSI installer file downloaded from [Zabbix Downloads](https://www.zabbix.com/download_agents)
+- Azure CLI or Azure Portal access
+
+### Step 1: Create Storage Account and Upload Installer
+
+Using Azure CLI:
+
+```bash
+# Create Storage Account
+az storage account create \
+  --name zabbixinstallers \
+  --resource-group monitoring-rg \
+  --location eastus \
+  --sku Standard_LRS \
+  --kind StorageV2
+
+# Create container with public blob access
+az storage container create \
+  --name installers \
+  --account-name zabbixinstallers \
+  --public-access blob
+
+# Upload the Zabbix Agent MSI file
+az storage blob upload \
+  --account-name zabbixinstallers \
+  --container-name installers \
+  --name zabbix_agent-7.0.0-windows-amd64-openssl.msi \
+  --file zabbix_agent-7.0.0-windows-amd64-openssl.msi
+
+# Get the public URL (no expiration)
+az storage blob url \
+  --account-name zabbixinstallers \
+  --container-name installers \
+  --name zabbix_agent-7.0.0-windows-amd64-openssl.msi \
+  --output tsv
+```
+
+The URL will be something like:
+```
+https://zabbixinstallers.blob.core.windows.net/installers/zabbix_agent-7.0.0-windows-amd64-openssl.msi
+```
+
+### Step 2: Installation Script for Offline Deployment
+
+Save this as `install-zabbix-agent-offline.ps1`:
+
+```powershell
+# ============================================
+# Zabbix Agent Installation Script
+# Uses Azure Storage Account (no internet required)
+# ============================================
+
+# Configuration Variables
+$ZabbixIP = "10.8.2.4"  # Zabbix Server/Proxy IP
+$InstallerUrl = "https://zabbixinstallers.blob.core.windows.net/installers/zabbix_agent-7.0.0-windows-amd64-openssl.msi"
+$TempDir = "C:\Temp"
+$InstallerPath = "$TempDir\zabbix_agent.msi"
+$LogFile = "$TempDir\zabbix_install.log"
+
+# Create temporary directory
+Write-Host "Creating temporary directory..."
+New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+
+# Download installer from Azure Storage
+Write-Host "Downloading Zabbix Agent from Azure Storage..."
+try {
+    Invoke-WebRequest -Uri $InstallerUrl -OutFile $InstallerPath -UseBasicParsing
+    Write-Host "Download completed successfully"
+} catch {
+    Write-Error "Error downloading installer: $_"
+    exit 1
+}
+
+# Verify file was downloaded
+if (!(Test-Path $InstallerPath)) {
+    Write-Error "Installer file not found at $InstallerPath"
+    exit 1
+}
+
+# Install Zabbix Agent
+Write-Host "Installing Zabbix Agent..."
+$InstallArgs = "/i `"$InstallerPath`" /qn /l*v `"$LogFile`" SERVER=$ZabbixIP SERVERACTIVE=$ZabbixIP HOSTNAME=$env:COMPUTERNAME LISTENPORT=10050"
+
+try {
+    Start-Process msiexec.exe -Wait -ArgumentList $InstallArgs -NoNewWindow
+    Write-Host "Installation completed"
+} catch {
+    Write-Error "Error during installation: $_"
+    exit 1
+}
+
+# Configure Windows Firewall
+Write-Host "Configuring firewall rule..."
+try {
+    New-NetFirewallRule -DisplayName "Zabbix Agent" `
+        -Direction Inbound `
+        -Protocol TCP `
+        -LocalPort 10050 `
+        -Action Allow `
+        -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "Firewall rule configured"
+} catch {
+    Write-Warning "Could not create firewall rule: $_"
+}
+
+# Verify service installation
+Write-Host "`nVerifying installation..."
+$Service = Get-Service -Name "Zabbix Agent" -ErrorAction SilentlyContinue
+
+if ($Service) {
+    Write-Host "Service status: $($Service.Status)"
+    
+    if ($Service.Status -ne "Running") {
+        Write-Host "Starting service..."
+        Start-Service -Name "Zabbix Agent"
+        Start-Sleep -Seconds 2
+        $Service = Get-Service -Name "Zabbix Agent"
+        Write-Host "Current status: $($Service.Status)"
+    }
+} else {
+    Write-Error "Zabbix Agent service not found"
+}
+
+# Display final information
+Write-Host "`n=== Installation Completed ==="
+Write-Host "Hostname: $env:COMPUTERNAME"
+Write-Host "Zabbix Server/Proxy: $ZabbixIP"
+Write-Host "Listen Port: 10050"
+Write-Host "Installation Log: $LogFile"
+```
+
+### Step 3: Deploy Using Azure Run Command
+
+**Single VM Deployment:**
+
+```bash
+az vm run-command invoke \
+  --resource-group monitoring-rg \
+  --name win-agent-01 \
+  --command-id RunPowerShellScript \
+  --scripts @install-zabbix-agent-offline.ps1
+```
+
+**Multiple VMs Deployment (Bash):**
+
+Save as `deploy-multiple-vms.sh`:
+
+```bash
+#!/bin/bash
+
+# Configuration
+RESOURCE_GROUP="monitoring-rg"
+VMS=("win-agent-01" "win-agent-02" "win-agent-03")
+
+echo "=== Deploying Zabbix Agent to Multiple VMs ==="
+echo ""
+
+for VM in "${VMS[@]}"; do
+    echo "Installing on VM: $VM"
+    
+    az vm run-command invoke \
+      --resource-group $RESOURCE_GROUP \
+      --name $VM \
+      --command-id RunPowerShellScript \
+      --scripts @install-zabbix-agent-offline.ps1 \
+      --output table
+    
+    echo "----------------------------------------"
+    echo ""
+done
+
+echo "=== Deployment Completed ==="
+```
+
+**Multiple VMs Deployment (PowerShell):**
+
+Save as `deploy-multiple-vms.ps1`:
+
+```powershell
+# Configuration
+$ResourceGroup = "monitoring-rg"
+$VMs = @("win-agent-01", "win-agent-02", "win-agent-03")
+$ScriptPath = "./install-zabbix-agent-offline.ps1"
+
+Write-Host "=== Deploying Zabbix Agent to Multiple VMs ===" -ForegroundColor Green
+Write-Host ""
+
+foreach ($VM in $VMs) {
+    Write-Host "Installing on VM: $VM" -ForegroundColor Yellow
+    
+    try {
+        Invoke-AzVMRunCommand `
+            -ResourceGroupName $ResourceGroup `
+            -VMName $VM `
+            -CommandId 'RunPowerShellScript' `
+            -ScriptPath $ScriptPath
+        
+        Write-Host "✓ Installation completed on $VM" -ForegroundColor Green
+    } catch {
+        Write-Host "✗ Error on $VM : $_" -ForegroundColor Red
+    }
+    
+    Write-Host "----------------------------------------"
+    Write-Host ""
+}
+
+Write-Host "=== Deployment Completed ===" -ForegroundColor Green
+```
+
+### Benefits of Azure Storage Approach
+
+- **No expiration** - The installer URL remains accessible indefinitely
+- **No internet required** - VMs only need access to Azure Storage endpoints
+- **Fast deployment** - Download from Azure datacenter (low latency)
+- **Scalable** - Deploy to unlimited number of VMs
+- **Version control** - Upload different versions with different names
+- **Cost-effective** - Minimal storage costs (few cents per month)
+
+### Network Requirements
+
+Ensure your VMs can reach Azure Storage endpoints. Add NSG rules if needed:
+
+**Outbound Rule:**
+- **Destination**: Service Tag `Storage`
+- **Port**: 443 (HTTPS)
+- **Protocol**: TCP
+- **Action**: Allow
+
+If using private networking, consider Azure Storage Service Endpoints or Private Endpoints for enhanced security.
+
 ## License
 
 This script is provided as-is for educational and operational purposes.
@@ -165,3 +401,4 @@ This script is provided as-is for educational and operational purposes.
 - [Zabbix Documentation](https://www.zabbix.com/documentation/current/)
 - [Azure Run Command Documentation](https://learn.microsoft.com/en-us/azure/virtual-machines/run-command-overview)
 - [Zabbix Agent Download](https://www.zabbix.com/download_agents)
+- [Azure Storage Documentation](https://learn.microsoft.com/en-us/azure/storage/)
