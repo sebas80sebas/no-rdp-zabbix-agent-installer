@@ -21,52 +21,13 @@ This solution uses Azure's **Run Command** feature to execute PowerShell scripts
 
 ## Installation Script
 
-The script performs the following actions:
-1. Tests network connectivity to verify internet access
-2. Creates a temporary directory for the installation files
-3. Downloads the Zabbix Agent installer from the official CDN
-4. Installs the agent with custom configuration parameters
-5. Verifies the service installation
-
-### Script: `install-zabbix-agent.ps1`
-
-```powershell
-# Configuration variables
-$ResourceGroup = "YOUR_RESOURCE_GROUP"
-$VMname = "YOUR_VM_NAME"
-$ZabbixIP = "YOUR_ZABBIX_SERVER_IP"
-
-$ZabbixServer = $ZabbixIP
-$ServerActive = $ZabbixIP
-$url = 'https://cdn.zabbix.com/zabbix/binaries/stable/7.4/7.4.6/zabbix_agent-7.4.6-windows-amd64-openssl.msi'
-$output = "C:\Temp\zabbix_agent.msi"
-
-# Create temp directory
-New-Item -ItemType Directory -Force -Path C:\Temp | Out-Null
-
-# Download Zabbix Agent installer
-Invoke-WebRequest -Uri $url -OutFile $output
-
-# Installation arguments
-$arguments = @(
-    '/i', $output,
-    '/qn',
-    "SERVER=$ZabbixServer",
-    "SERVERACTIVE=$ServerActive",
-    "HOSTNAME=$env:COMPUTERNAME",
-    'LISTENPORT=10050',
-    'ENABLEPATH=1',
-    '/l*v', 'C:\Temp\zabbix_install.log'
-)
-
-# Install Zabbix Agent
-Start-Process msiexec.exe -ArgumentList $arguments -Wait -NoNewWindow
-
-# Verify installation
-Get-Service 'Zabbix Agent'
-```
-
 > **Note:** For testing purposes, you can add `ping www.google.com` at the beginning of the script to verify internet connectivity before attempting the download.
+
+The script performs the following actions:
+1. Creates a temporary directory for the installation files
+2. Downloads the Zabbix Agent installer from the official CDN
+3. Installs the agent with custom configuration parameters
+4. Verifies the service installation
 
 ## Configuration Parameters
 
